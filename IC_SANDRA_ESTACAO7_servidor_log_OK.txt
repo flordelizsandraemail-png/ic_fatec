@@ -1,0 +1,559 @@
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <SPIFFS.h>
+#include <time.h>
+
+// Configurações da tela OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDRESS  0x3C  // Endereço I2C mais comum (tente 0x3D se não funcionar)
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Configurações do DHT11
+#define DHTPIN 26
+DHT dht(DHTPIN, DHT11);
+
+// Configurações WiFi
+const char *ssid = "AP1";
+const char *password = "10303401";
+
+// Configurações de Timezone (para Brasil)
+const char* ntpServer = "pool.ntp.br";
+const long gmtOffset_sec = -10800;  // -3 horas para Brasília
+const int daylightOffset_sec = 0;
+
+WebServer server(80);
+
+// Variáveis para controle do log
+unsigned long lastLogTime = 0;
+const unsigned long logInterval = 2 * 60 * 60 * 1000;
+
+// Flag para controle do OLED
+bool oledOK = false;
+
+// Protótipos das funções
+float readDHTTemperature();
+float readDHTHumidity();
+void handleRoot();
+void handleLog();
+void handleDownload();
+void handleClearLog();
+String getFormattedDateTime();
+void saveLog(float temp, float hum);
+void updateOLED(float temperature, float humidity);
+void setupSPIFFS();
+void initWiFi();
+void initTime();
+void showBootScreen();
+void showIPOnOLED();
+bool initOLED();
+
+// Função melhorada para inicializar o OLED
+bool initOLED() {
+  Serial.println("Inicializando OLED...");
+  
+  // Inicializar I2C primeiro
+  Wire.begin(21, 22);  // SDA = GPIO21, SCL = GPIO22
+  delay(100);
+  
+  // Tentar inicializar o display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("Falha ao inicializar OLED com endereco 0x3C");
+    
+    // Tentar com endereço alternativo 0x3D
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("Falha ao inicializar OLED com endereco 0x3D");
+      Serial.println("Verifique as conexoes:");
+      Serial.println("  - VCC -> 3.3V");
+      Serial.println("  - GND -> GND");
+      Serial.println("  - SDA -> GPIO21");
+      Serial.println("  - SCL -> GPIO22");
+      return false;
+    }
+  }
+  
+  // Limpar e configurar o display
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED OK!");
+  display.display();
+  delay(1000);
+  
+  Serial.println("OLED inicializado com sucesso!");
+  return true;
+}
+
+// Tela de boot personalizada
+void showBootScreen() {
+  if (!oledOK) return;
+  
+  display.clearDisplay();
+  
+  // Desenhar moldura dupla
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.drawRect(2, 2, 124, 60, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(22, 18);
+  display.println("PAISAGISMO");
+  
+  display.setCursor(38, 30);
+  display.println("FATEC SP");
+  
+  display.setTextSize(0);
+  display.setCursor(25, 45);
+  display.println("Estacao Meteorologica");
+  
+  display.setCursor(35, 55);
+  display.println("Iniciando...");
+  
+  display.display();
+}
+
+// Mostrar IP na tela OLED
+void showIPOnOLED() {
+  if (!oledOK) return;
+  
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(15, 8);
+  display.println("PAISAGISMO");
+  display.setCursor(42, 18);
+  display.println("FATEC SP");
+  
+  display.drawLine(5, 26, 123, 26, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(8, 35);
+  display.println("WiFi Conectado!");
+  
+  display.setCursor(8, 48);
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  
+  display.display();
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html>";
+  html += "<head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='60'>";
+  html += "<title>ESP32 - Estação Meteorológica</title>";
+  html += "<style>";
+  html += "body { font-family: Arial; text-align: center; margin-top: 20px; background: #f0f0f0; }";
+  html += ".container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; }";
+  html += "h1 { color: #2c3e50; }";
+  html += ".sensor-box { display: inline-block; width: 200px; margin: 20px; padding: 20px; border-radius: 10px; color: white; }";
+  html += ".temp { background: #e74c3c; }";
+  html += ".hum { background: #2ecc71; }";
+  html += ".value { font-size: 48px; font-weight: bold; }";
+  html += ".button { background-color: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }";
+  html += ".button.danger { background-color: #e74c3c; }";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>Estacao Meteorologica PAISAGISMO</h1>";
+  
+  float temp = readDHTTemperature();
+  float hum = readDHTHumidity();
+  
+  html += "<div class='sensor-box temp'>";
+  html += "<h2>Temperatura</h2>";
+  html += "<div class='value'>" + String(temp, 1) + "<span class='unit'>C</span></div>";
+  html += "</div>";
+  
+  html += "<div class='sensor-box hum'>";
+  html += "<h2>Umidade</h2>";
+  html += "<div class='value'>" + String(hum, 1) + "<span class='unit'>%</span></div>";
+  html += "</div>";
+  
+  html += "<div style='clear: both;'></div>";
+  html += "<div>";
+  html += "<a href='/log' class='button'> Ver Log</a>";
+  html += "<a href='/download' class='button'> Baixar CSV</a>";
+  html += "<a href='/clear' class='button danger' onclick='return confirm(\"Apagar logs?\")'> Limpar</a>";
+  html += "</div>";
+  html += "<p><small>Atualizacao: " + getFormattedDateTime() + "</small></p>";
+  html += "<p><small>Log a cada 2 horas</small></p>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleLog() {
+  String html = "<!DOCTYPE html><html>";
+  html += "<head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='120'>";
+  html += "<title>Log de Medicoes</title>";
+  html += "<style>";
+  html += "body { font-family: Arial; margin: 20px; background: #f0f0f0; }";
+  html += ".container { max-width: 1000px; margin: auto; background: white; padding: 20px; border-radius: 10px; }";
+  html += "h1 { color: #2c3e50; text-align: center; }";
+  html += "table { width: 100%; border-collapse: collapse; margin-top: 20px; }";
+  html += "th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }";
+  html += "th { background-color: #2c3e50; color: white; }";
+  html += "tr:nth-child(even) { background-color: #f2f2f2; }";
+  html += ".button { background-color: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1> Histórico de Medicoes</h1>";
+  
+  if (SPIFFS.exists("/logs.txt")) {
+    File file = SPIFFS.open("/logs.txt", "r");
+    if (file) {
+      html += "<table>";
+      html += "<tr><th>Data/Hora</th><th>Temperatura (C)</th><th>Umidade (%)</th></tr>";
+      
+      String lines[200];
+      int count = 0;
+      while (file.available() && count < 200) {
+        lines[count] = file.readStringUntil('\n');
+        lines[count].trim();
+        if (lines[count].length() > 0) count++;
+      }
+      file.close();
+      
+      for (int i = count - 1; i >= 0; i--) {
+        int comma1 = lines[i].indexOf(',');
+        int comma2 = lines[i].indexOf(',', comma1 + 1);
+        
+        if (comma1 > 0 && comma2 > 0) {
+          String datetime = lines[i].substring(0, comma1);
+          String temp = lines[i].substring(comma1 + 1, comma2);
+          String hum = lines[i].substring(comma2 + 1);
+          
+          html += "<tr>";
+          html += "<td>" + datetime + "</td>";
+          html += "<td>" + temp + " C</td>";
+          html += "<td>" + hum + " %</td>";
+          html += "</tr>";
+        }
+      }
+      html += "</table>";
+      html += "<p>Total: " + String(count) + " registros</p>";
+    }
+  } else {
+    html += "<p>Nenhum registro encontrado.</p>";
+  }
+  
+  html += "<div style='text-align: center;'>";
+  html += "<a href='/' class='button'> Voltar</a>";
+  html += "<a href='/download' class='button'> Baixar CSV</a>";
+  html += "</div></div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleDownload() {
+  if (!SPIFFS.exists("/logs.txt")) {
+    server.send(404, "text/plain", "Nenhum log encontrado");
+    return;
+  }
+  
+  File file = SPIFFS.open("/logs.txt", "r");
+  if (!file) {
+    server.send(500, "text/plain", "Erro ao abrir arquivo");
+    return;
+  }
+  
+  String content = "Data/Hora,Temperatura (C),Umidade (%)\n";
+  while (file.available()) {
+    content += file.readStringUntil('\n');
+    content += "\n";
+  }
+  file.close();
+  
+  server.sendHeader("Content-Type", "text/csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=logs_esp32.csv");
+  server.send(200, "text/csv", content);
+}
+
+void handleClearLog() {
+  if (SPIFFS.exists("/logs.txt")) {
+    SPIFFS.remove("/logs.txt");
+  }
+  
+  String html = "<!DOCTYPE html><html>";
+  html += "<head><meta http-equiv='refresh' content='3;url=/'></head>";
+  html += "<body><h2>✅ Log apagado!</h2>";
+  html += "<p>Redirecionando...</p></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void saveLog(float temp, float hum) {
+  if (temp == -1 || hum == -1) return;
+  
+  File file = SPIFFS.open("/logs.txt", FILE_APPEND);
+  if (!file) {
+    Serial.println("Erro ao abrir arquivo");
+    return;
+  }
+  
+  String logEntry = getFormattedDateTime() + "," + String(temp, 1) + "," + String(hum, 1);
+  file.println(logEntry);
+  file.close();
+  
+  Serial.println("Log salvo: " + logEntry);
+  
+  if (oledOK) {
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(25, 15);
+    display.println("✅ LOG SALVO!");
+    display.setCursor(10, 30);
+    display.print("Temp: "); display.print(temp, 1); display.println(" C");
+    display.setCursor(10, 45);
+    display.print("Umi:  "); display.print(hum, 1); display.println(" %");
+    display.display();
+    delay(3000);
+    updateOLED(temp, hum);
+  }
+}
+
+String getFormattedDateTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "00/00/0000 00:00:00";
+  }
+  
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+void updateOLED(float temperature, float humidity) {
+  if (!oledOK) return;
+  
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(8, 2);
+  display.println("PAISAGISMO");
+  display.setCursor(42, 11);
+  display.println("FATEC SP");
+  
+  display.drawLine(5, 20, 123, 20, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(10, 28);
+  display.print("Temp:");
+  display.setTextSize(2);
+  display.setCursor(60, 26);
+  display.print(temperature, 1);
+  display.setTextSize(1);
+  display.cp437(true);
+  display.write(247);
+  display.println("C");
+  
+  display.setTextSize(1);
+  display.setCursor(10, 48);
+  display.print("Umi:");
+  display.setTextSize(2);
+  display.setCursor(60, 46);
+  display.print(humidity, 1);
+  display.setTextSize(1);
+  display.println("%");
+  
+  display.display();
+}
+
+void setupSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Erro ao montar SPIFFS");
+    return;
+  }
+  Serial.println("SPIFFS OK");
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  if (oledOK) {
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(15, 20);
+    display.println("Conectando WiFi...");
+    display.setCursor(20, 35);
+    display.print("SSID: ");
+    display.println(ssid);
+    display.display();
+  }
+  
+  Serial.print("Conectando WiFi");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    
+    if (oledOK && attempts % 4 == 0) {
+      display.setCursor(15 + (attempts % 20), 50);
+      display.print(".");
+      display.display();
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Conectado!");
+    Serial.print("📡 IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ Falha WiFi");
+    if (oledOK) {
+      display.clearDisplay();
+      display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+      display.setCursor(20, 25);
+      display.println("Falha WiFi!");
+      display.setCursor(10, 40);
+      display.println("Verifique AP1");
+      display.display();
+    }
+  }
+}
+
+void initTime() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("Sincronizando hora");
+  
+  struct tm timeinfo;
+  int attempts = 0;
+  while (!getLocalTime(&timeinfo) && attempts < 20) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+  
+  if (attempts < 20) {
+    Serial.println("\n✅ Hora sincronizada!");
+    char buffer[30];
+    strftime(buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &timeinfo);
+    Serial.print("📅 Data: ");
+    Serial.println(buffer);
+  } else {
+    Serial.println("\n❌ Falha na hora");
+  }
+}
+
+float readDHTTemperature() {
+  float t = dht.readTemperature();
+  if (isnan(t)) {    
+    Serial.println("❌ Falha temperatura!");
+    return -1;
+  }
+  return t;
+}
+
+float readDHTHumidity() {
+  float h = dht.readHumidity();
+  if (isnan(h)) {
+    Serial.println("❌ Falha umidade!");
+    return -1;
+  }
+  return h;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n🚀 Iniciando Estacao PAISAGISMO");
+  
+  // Inicializar OLED primeiro
+  oledOK = initOLED();
+  
+  // Mostrar tela de boot se OLED funcionar
+  if (oledOK) {
+    showBootScreen();
+  } else {
+    Serial.println("⚠️ Sistema rodando sem display OLED");
+  }
+  
+  // Inicializar componentes
+  setupSPIFFS();
+  dht.begin();
+  initWiFi();
+  initTime();
+  
+  // Mostrar IP na tela
+  if (oledOK && WiFi.status() == WL_CONNECTED) {
+    showIPOnOLED();
+  }
+  
+  // Configurar servidor
+  server.on("/", handleRoot);
+  server.on("/log", handleLog);
+  server.on("/download", handleDownload);
+  server.on("/clear", handleClearLog);
+  server.begin();
+  
+  Serial.println("🌐 Servidor HTTP iniciado!");
+  Serial.print("📱 Acesse: http://");
+  Serial.println(WiFi.localIP());
+  
+  delay(2000);
+  
+  // Primeira leitura
+  float temp = readDHTTemperature();
+  float hum = readDHTHumidity();
+  
+  if (temp != -1 && hum != -1) {
+    saveLog(temp, hum);
+    lastLogTime = millis();
+  }
+  
+  if (oledOK) {
+    updateOLED(temp, hum);
+  }
+  
+  Serial.println("✅ Sistema pronto!");
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Log a cada 2 horas
+  if (millis() - lastLogTime >= logInterval) {
+    float temp = readDHTTemperature();
+    float hum = readDHTHumidity();
+    
+    if (temp != -1 && hum != -1) {
+      saveLog(temp, hum);
+      if (oledOK) updateOLED(temp, hum);
+      lastLogTime = millis();
+      Serial.println("⏰ Log automatico (2h)");
+    } else {
+      lastLogTime = millis() - (logInterval - 300000);
+    }
+  }
+  
+  // Atualizar OLED a cada 10s
+  static unsigned long lastOLEDUpdate = 0;
+  if (oledOK && (millis() - lastOLEDUpdate >= 10000)) {
+    float temp = readDHTTemperature();
+    float hum = readDHTHumidity();
+    if (temp != -1 && hum != -1) {
+      updateOLED(temp, hum);
+    }
+    lastOLEDUpdate = millis();
+  }
+  
+  delay(100);
+}
